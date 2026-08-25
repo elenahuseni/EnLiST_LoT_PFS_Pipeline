@@ -30,8 +30,8 @@ HAIKU_MAX_WORKERS = 8
 MODEL_PRICING = {
     MODEL_RID_HAIKU: {"input_per_1m": 1.00, "output_per_1m": 5.00},
     MODEL_RID_OPUS: {"input_per_1m": 5.00, "output_per_1m": 25.00},
-    MODEL_RID_GPT5_TERRA: {"input_per_1m": 1.25, "output_per_1m": 10.00},   # rough estimate
-    MODEL_RID_GPT5_SOL: {"input_per_1m": 1.25, "output_per_1m": 10.00},     # rough estimate
+    MODEL_RID_GPT5_TERRA: {"input_per_1m": 2, "output_per_1m": 12.00},   # rough estimate
+    MODEL_RID_GPT5_SOL: {"input_per_1m": 4, "output_per_1m": 20.00},     # rough estimate
 }
 
 # ---------------------------------------------------------------------------
