@@ -252,8 +252,10 @@ def _is_boundary(hay: str, idx: int) -> bool:
     return not hay[idx - 1].isalnum()
 
 
-def _find_all_headers(hay: str) -> List[Tuple[int, str, str]]:
-    """All boundary-anchored header hits: list of (pos, header, category), de-overlapped."""
+def _find_all_headers(hay: str, text: Optional[str] = None) -> List[Tuple[int, str, str]]:
+    """All boundary-anchored header hits: list of (pos, header, category), de-overlapped.
+    `text` = the original-case text (same length/offsets as `hay`), used for the cased
+    no-colon header rule (FIX 2)."""
     hits: List[Tuple[int, str, str]] = []
     for h in _ALL_HEADERS:
         start = 0
@@ -261,7 +263,11 @@ def _find_all_headers(hay: str) -> List[Tuple[int, str, str]]:
             j = hay.find(h, start)
             if j < 0:
                 break
-            if _is_boundary(hay, j) and _looks_like_header(hay, j, h):
+            ok = _looks_like_header(hay, j, h)
+            if (not ok and text is not None and h in _NO_COLON_HEADERS
+                    and not (j > 0 and (hay[j - 1] == "-" or hay[j - 1].isalnum()))):
+                ok = _looks_like_header_cased(text, j, h)
+            if _is_boundary(hay, j) and ok:
                 hits.append((j, h, _CATEGORY[h]))
             start = j + 1
     hits.sort(key=lambda t: (t[0], -len(t[1])))
@@ -273,6 +279,21 @@ def _find_all_headers(hay: str) -> List[Tuple[int, str, str]]:
             deduped.append((pos, h, cat))
             last_end = pos + len(h)
     return deduped
+
+
+# FIX 2: headers accepted WITHOUT a trailing colon / newline (flattened notes), but only when
+# written as a real header in the ORIGINAL text: ALL CAPS ("REVIEW OF SYSTEMS") or with the
+# last word capitalised ("Review of Systems"). Lower-case prose ("a review of systems was ...")
+# is still rejected. Deliberately limited to Review of Systems.
+_NO_COLON_HEADERS = {"review of systems", "12-point review of systems", "review of system"}
+
+
+def _looks_like_header_cased(text: str, j: int, h: str) -> bool:
+    orig = text[j:j + len(h)]
+    if not orig or not (orig[0].isupper() or orig[0].isdigit()):
+        return False
+    last = orig.split()[-1]
+    return orig.isupper() or last[:1].isupper()
 
 
 def _looks_like_header(hay: str, j: int, h: str) -> bool:
@@ -321,6 +342,40 @@ def _strip_structural(segment: str) -> str:
     return "\n".join(out).strip()
 
 
+# ---------------------------------------------------------------------------
+# 3a. CHEMOTHERAPY SUMMARY trimming (FIX 1)
+# ---------------------------------------------------------------------------
+# The Epic "Chemotherapy summary" template always ENDS with "Discontinue Reason: <value>".
+# In flattened notes the next section header often has no colon, so the section used to run on
+# and swallow the rest of the note (staging, HPI, ROS, exam ...). We cut each chemo-summary
+# segment right after its LAST Discontinue Reason value and hand the tail back to the note body.
+_DISC_VALUES = [
+    r"therapy complete(?:d)?", r"treatment complete(?:d)?", r"completed?",
+    r"disease progression", r"progression(?: of disease)?", r"toxicity", r"intolerance",
+    r"patient (?:preference|choice|request|decision|declined)",
+    r"physician (?:preference|decision)", r"provider (?:preference|decision)",
+    r"change in (?:treatment plan|therapy|treatment)", r"treatment plan changed",
+    r"transfer(?:red)? of care", r"hospice", r"death", r"deceased", r"expired",
+    r"insurance(?: denial)?", r"financial", r"other", r"unknown",
+]
+_DISC_REASON = re.compile(
+    r"(?i)discontinue reason\s*:\s*"
+    r"(?:\[[^\]\n]{0,160}\]"                          # [Plan is still active]
+    r"|(?:" + "|".join(_DISC_VALUES) + r")\b"         # known values
+    r"|(?:\S+[ \t]*){1,3})"                           # fallback: up to 3 words
+)
+
+
+def trim_chemo_summary(segment: str) -> Tuple[str, str]:
+    """Split a chemo-summary segment into (summary, leaked_tail). The summary ends right after
+    the LAST 'Discontinue Reason: <value>'. If the marker is absent, nothing is trimmed."""
+    ms = list(_DISC_REASON.finditer(segment or ""))
+    if not ms:
+        return segment, ""
+    end = ms[-1].end()
+    return segment[:end].strip(), segment[end:].strip()
+
+
 def dedupe_cth_paragraphs(blocks: List[Tuple[Optional[str], Optional[str]]]) -> Optional[str]:
     """Consolidate one CTH section for a patient by BLANK-LINE PARAGRAPH exact-dedup.
 
@@ -350,6 +405,54 @@ def dedupe_cth_paragraphs(blocks: List[Tuple[Optional[str], Optional[str]]]) -> 
             if key not in seen:
                 seen.add(key)
                 out.append(p)
+    return ("\n\n".join(out).strip() or None) if out else None
+
+
+# ---------------------------------------------------------------------------
+# 3b-iii. CHEMOTHERAPY SUMMARY regimen-level dedup (FIX 3)
+# ---------------------------------------------------------------------------
+_CHEMO_HDR = re.compile(r"(?i)^\s*chemotherapy summary\s*:?\s*")
+_TX_START = re.compile(r"(?i)treatment dates\s*:\s*(\d{1,2}/\d{1,2}/\d{2,4})")
+_FIRST_WORD = re.compile(r"\s*([A-Za-z][A-Za-z\-]+)")
+
+
+def _chemo_key(p: str):
+    """Regimen identity of one chemo-summary paragraph: (first drug word, treatment start
+    date(s)). Cycle counts ('6 of 12' -> '12 of 12'), end dates, doses and the Discontinue
+    Reason may drift between notes and are deliberately NOT part of the key. Paragraphs with
+    no 'Treatment Dates:' fall back to exact (whitespace/case-normalized) text."""
+    starts = tuple(sorted(set(_TX_START.findall(p))))
+    if not starts:
+        return ("txt", re.sub(r"\s+", " ", p).strip().lower())
+    m = _FIRST_WORD.match(_CHEMO_HDR.sub("", p))
+    return ("rx", m.group(1).lower() if m else "", starts)
+
+
+def dedupe_chemo_summary(blocks: List[Tuple[Optional[str], Optional[str]]]) -> Optional[str]:
+    """Consolidate a patient's Chemotherapy-summary snapshots to ONE paragraph per regimen.
+
+    blocks: list of (text, sort_key = note date). Paragraphs (blank-line split) are keyed by
+    _chemo_key; for each regimen the version from the MOST RECENT note is kept (so 'Therapy
+    Complete' supersedes '[Plan is still active]' and the final cycle count / end date win),
+    in order of first appearance. A paragraph whose start-date set is a strict subset of
+    another paragraph's (an older snapshot listing fewer plans) is dropped."""
+    order: List = []
+    latest: Dict = {}
+    for text, _ in sorted(blocks, key=lambda b: (b[1] is None, b[1] or "")):   # oldest first
+        if not text or not str(text).strip():
+            continue
+        for para in re.split(r"\n\s*\n", str(text)):
+            p = re.sub(r"\s*\bsubjective\b\s*$", "", para.strip(), flags=re.IGNORECASE).strip()
+            if not p:
+                continue
+            k = _chemo_key(p)
+            if k not in latest:
+                order.append(k)
+            latest[k] = p                    # a newer note overwrites -> latest version wins
+    rx_sets = {k: set(k[2]) for k in order if k[0] == "rx"}
+    keep = [k for k in order
+            if not (k[0] == "rx" and any(rx_sets[k] < s for kk, s in rx_sets.items() if kk != k))]
+    out = [latest[k] for k in keep]
     return ("\n\n".join(out).strip() or None) if out else None
 
 
@@ -417,7 +520,7 @@ def strip_boilerplate(note_text: Optional[str]) -> Dict[str, object]:
     text = _normalize(original)
     hay = text.lower()
 
-    hits = _find_all_headers(hay)
+    hits = _find_all_headers(hay, text)
 
     removed: List[str] = []
     kept: List[str] = []
@@ -445,8 +548,14 @@ def strip_boilerplate(note_text: Optional[str]) -> Dict[str, object]:
                 psh_parts.append(segment)
             elif cat == "cth":
                 removed.append(h)
-                cth_parts.append(segment)
                 sec = _CTH_SECTION.get(h, "treatment_history")
+                if sec == "chemotherapy_summary":
+                    # FIX 1: stop at the end of the template; leaked note text goes back
+                    # into the note body (still subject to the structural line filters).
+                    segment, tail = trim_chemo_summary(segment)
+                    if tail:
+                        keep_parts.append(tail)
+                cth_parts.append(segment)
                 cth_by_section.setdefault(sec, []).append(segment)
             else:  # keep
                 kept.append(h)

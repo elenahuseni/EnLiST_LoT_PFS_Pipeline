@@ -27,7 +27,7 @@ from transforms.api import transform, Input, Output
 
 from myproject import config as C
 from myproject.note_cleaning import (
-    strip_boilerplate, CTH_SECTION_KEYS, dedupe_cth_paragraphs,
+    strip_boilerplate, CTH_SECTION_KEYS, dedupe_chemo_summary,
     strip_research_coordinator_questionnaires,
 )
 from myproject.text_sections import extract_excerpt  # fallback for flagged_empty notes
@@ -67,12 +67,13 @@ def _excerpt_udf(note_text, note_type_name, author_type):
 
 @F.udf(returnType=T.StringType())
 def _dedupe_paragraphs_udf(arr):
-    """Blank-line paragraph exact-dedup across a patient's snapshots of ONE CTH section."""
+    """Regimen-level dedup (FIX 3) across a patient's Chemotherapy-summary snapshots: one
+    paragraph per regimen (first drug + treatment start date), latest version wins."""
     blocks = [
         (r["v"], (str(r["d"]) if r["d"] is not None else None))
         for r in (arr or []) if r is not None and r["v"]
     ]
-    return dedupe_cth_paragraphs(blocks)
+    return dedupe_chemo_summary(blocks)
 
 
 @transform(

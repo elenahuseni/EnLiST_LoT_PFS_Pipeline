@@ -64,9 +64,17 @@ The message below the prompt assembles these blocks for ONE patient, in this ord
     doubt a surgery/biopsy that a note or the OncHx documents just because there is no matching
     pathology report. These reports are NOT separately retrievable (date + type is all you get).
 
+(7) PROGRESSION EVIDENCE (physician-adjudicated cPD) - for each imaging PROGRESSION_CANDIDATE scan,
+    a pre-computed verdict of whether a TREATING CLINICIAN corroborated that progression, shown as
+    "ScanDate | Scan_Note | cPD? | CorrobDate | Evidence/Reason". cPD=YES = corroborated (physician
+    quote + date); cPD=NO = the note review found stability / no confirmation (reason given). This
+    is the ADJUDICATED view of block (4) and is your PRIMARY cPD source (section 7). It covers
+    imaging-flagged scans ONLY - a line can still progress with NO row (clinical/marker/outside-scan
+    progression), which you detect from the notes.
+
 HOW TO USE THE ORIENTATION: build the regimen backbone from (1) + (3), pin dates with (1) + (2),
-then use (4) + (5) via get_notes to resolve setting, intent, cPD, and stop reasons; use (6) to pin
-precise surgery / biopsy dates for local-therapy fields and PFS censor dating.
+then use (4) + (7) for progression (cPD) and (5) via get_notes to resolve setting, intent, and stop
+reasons; use (6) to pin precise surgery / biopsy dates for local-therapy fields and PFS censor dating.
 
 TRUSTED STRUCTURED SIGNALS (in the secure_onchx events and note text):
   - "TX-Chemotherapy/Biotherapy/Investigational ...", "TX-Surgery", "TX-Radiation" events WITH a
@@ -108,8 +116,9 @@ DATA QUIRKS you must handle:
   history), and findings (PCI/CCR). The cumulative treatment-history block has been pulled OUT of
   the body (you already have the best copy in the CTH note blocks, section-1 block (3)).
 
-  Use it to: read a specific note; find the oncologist note that CORROBORATES a candidate imaging
-  progression (near_date around the scan); or resolve a start/stop date or the stated intent.
+  Use it to: read a specific note; resolve a start/stop date or the stated intent; corroborate
+  progression for a line that has NO row in the PROGRESSION EVIDENCE block (block 7) - or to invoke
+  the block's escape hatch (near_date around the scan, author_types=["clinician"]).
   Examples:
     TOOL_CALL: {"name": "get_notes", "args": {"note_ids": ["11111111", "22222222"]}}
     TOOL_CALL: {"name": "get_notes", "args": {"near_date": "2020-01-15", "window_days": 30}}
@@ -188,8 +197,11 @@ STEP 6 - OUTPUT the ordered episodes as FINAL_ANSWER (section 13). Your FIRST FI
   inadequate response) is the ONLY driver of a NEW line. (Metastases found at surgery / on biopsy =
   cPD.)
 
-- investigational-only: EVERY agent in the regimen is unapproved at the time given. A trial agent
-  added to an approved backbone is NOT investigational-only.
+- investigational-only: EVERY agent in the regimen is unapproved AT THE TIME GIVEN, where
+  "unapproved" = NOT approved by the FDA or EMA for ANY indication as of that date. A drug that is
+  FDA/EMA-approved for a DIFFERENT cancer (used off-label, or on a trial, in CRC/pancreas) is
+  APPROVED, not investigational - being "investigational in THIS cancer" does NOT make it iLoT. A
+  trial agent added to an approved backbone is NOT investigational-only.
 
 ==========================================================
 5. change_trigger -> choose EXACTLY ONE per episode (maps to the 4 EnLiST guidelines)
@@ -265,8 +277,13 @@ R7. iLoT (investigational-only) DETECTION. A regimen is iLoT (change_trigger "in
       Tremelimumab+MEDI4736 when both investigational; TT-00420; M1774; LVGN6051+LVGN3616).
     - A trial that ADDS an investigational agent to an APPROVED backbone (e.g. FOLFOX + trial-drug;
       atezolizumab + capecitabine + bev) is NOT iLoT -> classify by the normal rules.
-    - A now-approved drug used on a trial for a DIFFERENT indication is NOT investigational (e.g.
-      Nivolumab+Ipilimumab; Fruquintinib once approved) -> normal aLoT.
+    - A drug FDA/EMA-approved for ANY indication at the time is NOT investigational, even if used
+      off-label or on a phase-I / basket trial in CRC/pancreas. Test EACH agent for approval
+      ANYWHERE as of the treatment date - NOT approval in this cancer. Agents that are APPROVED
+      (=> aLoT, NOT iLoT): olaparib (2014), palbociclib (2015), copanlisib (2017), binimetinib
+      (2018), trametinib/dabrafenib, encorafenib, Nivolumab+Ipilimumab, Fruquintinib (once approved).
+      So e.g. copanlisib+olaparib and binimetinib+palbociclib are aLoT, NOT iLoT, even on a trial.
+      A regimen is iLoT ONLY when NONE of its agents was FDA/EMA-approved anywhere at that date.
     Do NOT invent a line from a bare protocol/trial mention, and never duplicate a trial regimen you
     already listed. When unsure whether ALL agents are unapproved, set sact_investigational and flag
     it in manual_review_flags.
@@ -274,20 +291,41 @@ R7. iLoT (investigational-only) DETECTION. A regimen is iLoT (change_trigger "in
 ==========================================================
 7. IMAGING TRAJECTORY + cPD CORROBORATION (CRITICAL - do not violate)
 ==========================================================
-You are given a pre-classified IMAGING TRAJECTORY (each scan labeled PROGRESSION_CANDIDATE /
-NO_PROGRESSION / INDETERMINATE / NOT_RELEVANT). Use it to LOCATE candidate progression. An imaging
-PROGRESSION_CANDIDATE is a CANDIDATE ONLY. Progression counts only when a TREATING-CLINICIAN note
-(Physician/PA/NP/Fellow/Resident) on/after that scan CORROBORATES it (acknowledges PD and/or acts
-on it - changes therapy, refers to hospice).
+You are given a PROGRESSION EVIDENCE block (block 7) that has ALREADY checked each imaging
+PROGRESSION_CANDIDATE scan against the treating-clinician notes. USE IT as your primary cPD source -
+do NOT re-adjudicate corroborated scans yourself:
+  - cPD=YES  -> a treating clinician corroborated that scan's progression. Treat it as a CONFIRMED
+     cPD; first_pd for the line it falls in = that scan's date (the temporal race below).
+  - cPD=NO   -> a physician-note review found stability / no confirmation (see the row's reason).
+     Do NOT count it as progression UNLESS, on reading the notes, you find an EXPLICIT treating-
+     clinician progression statement the review missed (rare ESCAPE HATCH - cite the verbatim quote
+     in evidence).
+  - NO ROW for a line (the block covers imaging-flagged scans ONLY) -> the line can still have
+     progressed CLINICALLY (rising markers / symptoms) or on an OUTSIDE scan. DETECT that yourself
+     from the notes as usual: a TREATING-CLINICIAN note (Physician/PA/NP/Fellow/Resident) that
+     acknowledges PD and/or acts on it (changes therapy, refers to hospice). Imaging or a structured
+     label ALONE is never sufficient; a coordinator/nurse note is not.
+For the scans it covers, this block REPLACES the old "retrieve a clinician note to corroborate each
+imaging candidate" step - you read notes for cPD only when there is NO row (or to invoke the escape
+hatch).
 
 *** THE pfs_censor_flag DECISION IS A TEMPORAL RACE: what happened FIRST on this line? ***
 For each line, find these two candidate dates WITHIN the line window (>= line start, < next line start):
-  (A) first CORROBORATED cPD date  (earliest PD scan an oncologist acknowledges/acts on)
-  (B) first LOCAL THERAPY date on this line's disease (surgery / RT / ablation). PIN this date from
-      the PATHOLOGY / SURGICAL SPECIMEN TIMELINE (block 6) when a matching report exists - its
-      collection date IS the procedure date. If the local therapy is documented in a note but has
-      NO pathology report (e.g. outside/OSH), still use it: absence of a pathology report does NOT
-      cancel a documented local therapy.
+  (A) first CORROBORATED cPD date - the earliest cPD=YES scan in the PROGRESSION EVIDENCE block
+      (block 7) within the window (use its scan date); OR, if the line has NO row there, the
+      earliest progression you corroborate from the notes (clinical/marker/outside-scan PD a
+      treating clinician acknowledges/acts on)
+  (B) first DISEASE-DIRECTED LOCAL THERAPY date on this line's disease - a CURATIVE / ABLATIVE
+      treatment of the cancer (metastasectomy, curative resection, SBRT, RFA/ablation). PALLIATIVE
+      procedures do NOT count here and NEVER trigger a 'Local therapy no PD' censor: palliative
+      resection / diversion / stent for a bowel obstruction, palliative RT for pain or bleeding,
+      biliary or ureteric stents, drains. A bowel obstruction or similar complication often signals
+      PROGRESSION, not disease control - and if the SAME SACT CONTINUES after the palliative
+      procedure, the line did NOT end there. PIN a qualifying (disease-directed) local-therapy date
+      from the PATHOLOGY / SURGICAL SPECIMEN TIMELINE (block 6) when a matching report exists - its
+      collection date IS the procedure date. If it is documented in a note but has NO pathology
+      report (e.g. outside/OSH), still use it: absence of a pathology report does NOT cancel a
+      documented local therapy.
 Then decide by WHICHEVER CAME FIRST:
   - PROGRESSION FIRST (A exists and A <= B, or B does not exist)
         -> pfs_censor_flag = 1 (PFS EVENT). first_pd_date = A (the scan exam_date). reason_for_switching = 8a.i.
@@ -313,6 +351,7 @@ Worked micro-examples:
   - cPD on CT 05/2018 (onc acts), THEN liver resection 07/2018.  Progression first -> flag=1, first_pd_date=05/2018.
   - liver resection 03/2019 while responding, cPD only appears 09/2019 on a LATER line.  Local therapy first -> flag=0, censor 03/2019, reason 'Local therapy no PD'.
   - switched for neuropathy, no PD, no local therapy.  Neither -> flag=0, censor at switch, reason 'Switched no PD'.
+  - palliative resection for a bowel OBSTRUCTION on FOLFIRI, chemo RESUMED afterward.  Palliative (not disease-directed) -> NOT a 'Local therapy no PD' censor; keep the line open and race any later corroborated cPD as the event.
 Never record a PFS event (flag=1) from an imaging PD you could not corroborate in a note.
 
 *** flag=1 REQUIRES a corroborated ON-LINE cPD dated BEFORE the line's ending trigger. ***
@@ -323,10 +362,13 @@ that trigger - it is a CENSOR (flag=0), NOT an event. Common censor cases (both 
 the agent tends to mis-flag them as events):
   - Switched to a different SACT with no documented PD -> flag=0, pfs_censor_reason 'Switched no PD',
     censor at the switch (Level-3 = last administration if no qualifying scan/note).
-  - A resection / RT / ablation occurred on the line with no PRIOR on-line cPD (even if a scan later
-    shows growth) -> flag=0, pfs_censor_reason 'Local therapy no PD', censor at the local-therapy
-    date (or a qualifying Level-1 scan just before it). If you recorded a local_therapy date on a
-    line, default to CENSOR unless a corroborated cPD is dated strictly BEFORE that local therapy.
+  - A DISEASE-DIRECTED resection / RT / ablation (curative/ablative, per section 7 (B)) occurred on
+    the line with no PRIOR on-line cPD (even if a scan later shows growth) -> flag=0,
+    pfs_censor_reason 'Local therapy no PD', censor at the local-therapy date (or a qualifying
+    Level-1 scan just before it). This default-to-CENSOR applies ONLY to disease-directed local
+    therapy: a PALLIATIVE procedure (obstruction resection / stent, palliative RT) does NOT censor -
+    if the SACT CONTINUES after it, keep the line open and race any later corroborated cPD as the
+    event.
 
 ==========================================================
 8. CENSOR DATE - 3-LEVEL HIERARCHY
@@ -366,10 +408,12 @@ pfs_censor_reason - OUTPUT EXACTLY ONE of these enum values (never free text; pu
   no PD'; early->advanced continuation = 'Setting change'; anything else (incl. planned completion
   with no recurrence) = 'Other'. Leave null ONLY when pfs_censor_flag = 1 (a PFS event, not a censor).
 
-LOCAL-THERAPY vs PROGRESSION (TEMPORAL, not blanket precedence): local therapy CENSORS the line
-  (flag=0) only when it occurred BEFORE any corroborated cPD on that line (section 7 race). If cPD
-  occurred FIRST and local therapy followed, the line is a PFS EVENT (flag=1) dated at the cPD - the
-  later local therapy does NOT convert it back to a censor. Does NOT apply once a new line started.
+LOCAL-THERAPY vs PROGRESSION (TEMPORAL, not blanket precedence): a DISEASE-DIRECTED local therapy
+  (curative/ablative; section 7 (B)) CENSORS the line (flag=0) only when it occurred BEFORE any
+  corroborated cPD on that line (section 7 race). PALLIATIVE procedures (obstruction resection /
+  stent, palliative RT for symptoms) NEVER censor. If cPD occurred FIRST and local therapy followed,
+  the line is a PFS EVENT (flag=1) dated at the cPD - the later local therapy does NOT convert it
+  back to a censor. Does NOT apply once a new line started.
 
 ==========================================================
 9. DATES + UNCERTAINTY (U0-U4) for every date field
@@ -388,6 +432,9 @@ U-code from the earliest/latest window, so provide a plausible window: exact day
 11. LOCAL THERAPY (up to 3 per episode) - item 4c/4d/4e
 ==========================================================
 modality (4c Surgery | 4d Radiotherapy | 4e Other), date, free-text description.
+A PALLIATIVE procedure (obstruction resection / diversion / stent, palliative RT for pain or
+bleeding) MAY be recorded here - say "palliative" in the description - but it does NOT drive the PFS
+censor race (section 7): only DISEASE-DIRECTED curative/ablative local therapy can censor a line.
 DATING: when the local therapy is a surgery or biopsy, PIN local_therapy_N_date from the matching
 report in the PATHOLOGY / SURGICAL SPECIMEN TIMELINE (block 6) - the specimen COLLECTION date is the
 procedure date (a 'Surgical Case' / 'Surgical Biopsy' report is definitive proof of a resection /
